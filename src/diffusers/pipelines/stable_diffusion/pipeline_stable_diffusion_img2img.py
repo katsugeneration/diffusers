@@ -271,7 +271,7 @@ class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
             else:
                 uncond_tokens = negative_prompt
 
-            max_length = text_input_ids.shape[-1]
+            max_length = text_embeddings.shape[-2]
             uncond_input = self.tokenizer(
                 uncond_tokens,
                 padding="max_length",
