@@ -19,6 +19,7 @@ import torchvision
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
+import datasets
 
 
 logger = get_logger(__name__)
@@ -276,8 +277,8 @@ def main():
     )
 
     if args.target_dataset == "CelebA":
-        dataset = torchvision.datasets.CelebA('./', split='valid')
-    images = [img for img, _ in dataset]
+        dataset = datasets.load_dataset("huggan/CelebA-HQ", split="valid")
+        images = [data['image'] for data in dataset[:1000]]
 
     init_image = image_transforms(images)
     init_image = init_image[None].to(device=accelerator.device, dtype=weight_dtype)
