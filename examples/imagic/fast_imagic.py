@@ -154,6 +154,7 @@ def parse_args():
         ),
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
+    parser.add_argument("--optimized_path", type=str, default=None, help="Path to optimized embeddings checkpoint")
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -359,10 +360,13 @@ def main():
 
         accelerator.wait_for_everyone()
     
-    progress_bar = tqdm(range(args.emb_train_steps), disable=not accelerator.is_local_main_process)
-    progress_bar.set_description("Optimizing embedding")
-    
-    train_loop(progress_bar, optimizer, optimized_embeddings)
+    if args.optimized_path is None:
+        progress_bar = tqdm(range(args.emb_train_steps), disable=not accelerator.is_local_main_process)
+        progress_bar.set_description("Optimizing embedding")
+        
+        train_loop(progress_bar, optimizer, optimized_embeddings)
+    else:
+        optimized_embeddings.load_state_dict(torch.load(args.optimized_path, map_location=accelerator.device))
 
     optimized_embeddings.requires_grad_(False)
     if accelerator.is_main_process:
