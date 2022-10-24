@@ -229,7 +229,7 @@ class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
             init_image = preprocess(init_image)
 
         # get prompt text embeddings
-        if text_embeddings is not None:
+        if text_embeddings is None:
             text_inputs = self.tokenizer(
                 prompt,
                 padding="max_length",
