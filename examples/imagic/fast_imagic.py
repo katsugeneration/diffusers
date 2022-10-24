@@ -277,11 +277,11 @@ def main():
     )
 
     if args.target_dataset == "CelebA":
-        dataset = datasets.load_dataset("huggan/CelebA-HQ", split="valid")
-        images = [data['image'] for data in dataset[:1000]]
+        dataset = datasets.load_dataset("huggan/CelebA-faces", split="train")
+        images = [data['image'] for data in dataset[:100]]
 
-    init_image = image_transforms(images)
-    init_image = init_image[None].to(device=accelerator.device, dtype=weight_dtype)
+    init_images = [image_transforms(im) for im in images]
+    init_image = torch.stack(init_images).to(device=accelerator.device, dtype=weight_dtype)
     with torch.inference_mode():
         init_latents = vae.encode(init_image).latent_dist.sample()
         init_latents = 0.18215 * init_latents
