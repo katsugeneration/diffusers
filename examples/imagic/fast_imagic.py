@@ -329,7 +329,7 @@ def main():
     def train_loop(pbar, optimizer, params):
         loss_avg = AverageMeter()
         for step in pbar:
-            latents = next(iter(loader))
+            latents = next(iter(loader))[0]
             with accelerator.accumulate(unet):
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
