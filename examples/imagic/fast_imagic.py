@@ -278,7 +278,7 @@ def main():
 
     if args.target_dataset == "CelebA":
         dataset = datasets.load_dataset("huggan/CelebA-faces", split="train")
-        images = [data['image'] for data in dataset[:100]]
+        images = dataset[:100]['image']
 
     init_images = [image_transforms(im) for im in images]
     init_image = torch.stack(init_images).to(device=accelerator.device, dtype=weight_dtype)
