@@ -370,7 +370,7 @@ def main():
         progress_bar = tqdm(range(args.emb_train_steps), disable=not accelerator.is_local_main_process)
         progress_bar.set_description("Optimizing embedding")
 
-        train_loop(progress_bar, optimizer, optimized_embeddings)
+        train_loop(progress_bar, optimizer, style_init_latents, optimized_embeddings)
     else:
         optimized_embeddings = torch.load(args.optimized_path, map_location=accelerator.device)
 
