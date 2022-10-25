@@ -291,7 +291,7 @@ def main():
         init_latents = 0.18215 * init_latents
 
     style_init_image = image_transforms(style_image)
-    init_image = style_init_image[None].to(device=accelerator.device, dtype=weight_dtype)
+    style_init_image = style_init_image[None].to(device=accelerator.device, dtype=weight_dtype)
     with torch.inference_mode():
         style_init_latents = vae.encode(style_init_image).latent_dist.sample()
         style_init_latents = 0.18215 * style_init_latents
