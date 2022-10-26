@@ -11,7 +11,7 @@ import torch.utils.checkpoint
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
-from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel
+from diffusers import AutoencoderKL, DDIMScheduler, StableDiffusionPipeline, UNet2DConditionModel
 from huggingface_hub import HfFolder, Repository, whoami
 from PIL import Image
 import numpy as np
@@ -161,6 +161,7 @@ def parse_args():
         ),
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
+    parser.add_argument("--train_inference_steps", type=int, default=50, help="DDIM steps")
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -260,9 +261,10 @@ def main():
     else:
         optimizer_class = torch.optim.Adam
 
-    noise_scheduler = DDPMScheduler(
-        beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000
+    noise_scheduler = DDIMScheduler(
+        beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=100
     )
+    noise_scheduler.set_timesteps(args.train_inference_steps)
 
     weight_dtype = torch.float32
     if args.mixed_precision == "fp16":
@@ -279,7 +281,7 @@ def main():
 
     # Encode the input image.
     if args.target_dataset == "Imagenet":
-        dataset = datasets.load_dataset("mrm8488/ImageNet1K-val")
+        dataset = datasets.load_dataset("mrm8488/ImageNet1K-val", split="train")
 
     image_transforms = transforms.Compose(
         [
@@ -324,9 +326,8 @@ def main():
         imgpath = os.path.join(path, f"{key}_step_{step:06}.png")
         img.save(imgpath)
 
-    latents = torch.stack([encode_image(data) for data in dataset['image']])
-    dataset = torch.utils.data.TensorDataset(latents)
-    loader = torch.utils.data.DataLoader(dataset, batch_size=args.train_batch_size, shuffle=True)
+    latents = torch.cat([encode_image(data) for data in dataset[:100]['image']])
+    loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(latents), batch_size=args.train_batch_size, shuffle=True)
 
     # Encode the target text.
     text_ids = tokenizer(
@@ -341,9 +342,18 @@ def main():
     with torch.inference_mode():
         target_embeddings = text_encoder(text_ids)[0]
 
-    del text_encoder, dataset
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    unconditioned_text_ids = tokenizer(
+        "",
+        padding="max_length",
+        truncation=True,
+        max_length=tokenizer.model_max_length,
+        return_tensors="pt",
+    ).input_ids
+
+    unconditioned_text_ids = unconditioned_text_ids.to(device=accelerator.device)
+    with torch.no_grad():
+        unconditioned_text_embeddings = text_encoder(unconditioned_text_ids)[0]
+    unconditioned_text_embeddings.requires_grad_(False)
 
     # Compute CLIP Loss
     valid_exts = [".png", ".jpg", ".jpeg"]
@@ -353,8 +363,12 @@ def main():
         if os.path.splitext(file_name)[1].lower() in valid_exts
     ]
     with torch.inference_mode():
-        decode_images = [decode_image(latent).permute(0, 3, 1, 2)[0] for latent in latents[:100]]
-        clip_loss.set_img2img_direction(decode_images, file_list)
+        decode_images = decode_image(latents[:100]).permute(0, 3, 1, 2)
+        clip_loss.set_img2img_direction(list(decode_images), file_list)
+
+    del text_encoder, dataset, decode_images
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     target_embeddings = target_embeddings.float()
     optimized_embeddings = target_embeddings.clone()
@@ -380,22 +394,23 @@ def main():
         loss_avg = AverageMeter()
         for step in pbar:
             init_latents = next(iter(loader))[0]
-            with accelerator.accumulate(unet, vae):
+            with accelerator.accumulate(unet):
                 noise = torch.randn_like(init_latents)
                 bsz = init_latents.shape[0]
                 # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (1,), device=accelerator.device)
+                timesteps = torch.randint(0, args.train_inference_steps, (1,), device=accelerator.device)
                 timesteps = timesteps.long()
 
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
-                noisy_latents = noise_scheduler.add_noise(init_latents, noise, [timesteps] * bsz)
+                with torch.no_grad():
+                    noisy_latents = noise_scheduler.add_noise(init_latents, noise, torch.tensor([noise_scheduler.timesteps[-timesteps]] * bsz, device=accelerator.device))
 
-                sample_origin = denoise(noisy_latents, noise_scheduler.config.num_train_timesteps - timesteps, cond_embeddings=None)
-                sample_conditioned = denoise(noisy_latents, noise_scheduler.config.num_train_timesteps - timesteps, cond_embeddings=optimized_embeddings)
+                    sample_origin = denoise(noisy_latents, args.train_inference_steps - timesteps, cond_embeddings=torch.cat([unconditioned_text_embeddings]*bsz))
+                    decode_origin = decode_image(sample_origin.to(dtype=weight_dtype))
 
-                decode_origin = decode_image(sample_origin)
-                decode_conditioned = decode_image(sample_conditioned)
+                sample_conditioned = denoise(noisy_latents, args.train_inference_steps - timesteps, cond_embeddings=torch.cat([optimized_embeddings]*bsz))
+                decode_conditioned = decode_image(sample_conditioned.to(dtype=weight_dtype))
 
                 loss = clip_loss(decode_origin, decode_conditioned)
 
@@ -420,7 +435,7 @@ def main():
     progress_bar = tqdm(range(args.emb_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Optimizing embedding")
     
-    train_loop(progress_bar, optimizer, optimized_embeddings)
+    train_loop(progress_bar, optimizer)
 
     optimized_embeddings.requires_grad_(False)
     if accelerator.is_main_process:
@@ -446,16 +461,16 @@ def main():
     # train_loop(progress_bar, optimizer, unet.parameters())
 
     # Create the pipeline using using the trained modules and save it.
-    if accelerator.is_main_process:
-        pipeline = StableDiffusionPipeline.from_pretrained(
-            args.pretrained_model_name_or_path,
-            unet=accelerator.unwrap_model(unet),
-            use_auth_token=True
-        )
-        pipeline.save_pretrained(args.output_dir)
+    # if accelerator.is_main_process:
+    #     pipeline = StableDiffusionPipeline.from_pretrained(
+    #         args.pretrained_model_name_or_path,
+    #         unet=accelerator.unwrap_model(unet),
+    #         use_auth_token=True
+    #     )
+    #     pipeline.save_pretrained(args.output_dir)
 
-        if args.push_to_hub:
-            repo.push_to_hub(commit_message="End of training", blocking=False, auto_lfs_prune=True)
+    #     if args.push_to_hub:
+    #         repo.push_to_hub(commit_message="End of training", blocking=False, auto_lfs_prune=True)
 
     accelerator.end_training()
 
