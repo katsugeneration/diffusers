@@ -279,7 +279,7 @@ def main():
 
     # Encode the input image.
     if args.target_dataset == "Imagenet":
-        dataset = datasets.load_dataset("imagenet-1k", split="valid")
+        dataset = datasets.load_dataset("mrm8488/ImageNet1K-val")
 
     image_transforms = transforms.Compose(
         [
@@ -324,7 +324,7 @@ def main():
         imgpath = os.path.join(path, f"{key}_step_{step:06}.png")
         img.save(imgpath)
 
-    latents = [encode_image(data['image']) for data in dataset]
+    latents = torch.stack([encode_image(data) for data in dataset['image']])
     dataset = torch.utils.data.TensorDataset(latents)
     loader = torch.utils.data.DataLoader(dataset, batch_size=args.train_batch_size, shuffle=True)
 
@@ -346,13 +346,15 @@ def main():
         torch.cuda.empty_cache()
 
     # Compute CLIP Loss
+    valid_exts = [".png", ".jpg", ".jpeg"]
     file_list = [
         os.path.join(args.style_img_dir, file_name)
         for file_name in os.listdir(args.style_img_dir)
-        if os.path.isfile(file_name)
+        if os.path.splitext(file_name)[1].lower() in valid_exts
     ]
-    decode_images = [decode_image(latent) for latent in latents[:100]]
-    clip_loss.set_img2img_direction(decode_images, file_list)
+    with torch.inference_mode():
+        decode_images = [decode_image(latent).permute(0, 3, 1, 2)[0] for latent in latents[:100]]
+        clip_loss.set_img2img_direction(decode_images, file_list)
 
     target_embeddings = target_embeddings.float()
     optimized_embeddings = target_embeddings.clone()
@@ -372,7 +374,7 @@ def main():
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        accelerator.init_trackers("imagic", config=vars(args))
+        accelerator.init_trackers("ldm_clip", config=vars(args))
 
     def train_loop(pbar, optimizer):
         loss_avg = AverageMeter()
@@ -411,7 +413,7 @@ def main():
                 with torch.no_grad():
                     samples = torch.cat([decode_origin, decode_conditioned], dim=-1).to("cpu")
                     samples = torch.cat(list(samples), dim=-2)
-                    save_logs(samples, args.output_dir, step)
+                    save_logs(samples, args.logging_dir, step)
 
         accelerator.wait_for_everyone()
     
