@@ -262,7 +262,7 @@ def main():
         optimizer_class = torch.optim.Adam
 
     noise_scheduler = DDIMScheduler(
-        beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=100
+        beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000
     )
     noise_scheduler.set_timesteps(args.train_inference_steps)
 
@@ -304,7 +304,6 @@ def main():
         latents = 1 / 0.18215 * latents
         image = vae.decode(latents).sample
         image = (image / 2 + 0.5).clamp(0, 1)
-        image = image.cpu().permute(0, 2, 3, 1)
         return image
 
     def denoise(latents, t_start, cond_embeddings=None):
@@ -321,13 +320,27 @@ def main():
             latents = noise_scheduler.step(noise_pred, t, latents).prev_sample
         return latents
 
+    def denoise_one_step(latents, t_start, cond_embeddings=None):
+        t = noise_scheduler.timesteps[t_start].to(accelerator.device)
+
+        # expand the latents if we are doing classifier free guidance
+        latent_model_input = noise_scheduler.scale_model_input(latents, t)
+
+        # predict the noise residual
+        noise_pred = unet(latent_model_input, t, encoder_hidden_states=cond_embeddings).sample
+
+        # compute the previous noisy sample x_t -> x_t-1
+        pred = noise_scheduler.step(noise_pred, t, latents).pred_original_sample
+        return pred
+
     def save_logs(img, path, step, key="sample"):
-        img = Image.fromarray(img.numpy())
+        img = Image.fromarray((255 * img.permute(1, 2, 0).numpy()).astype(np.uint8))
         imgpath = os.path.join(path, f"{key}_step_{step:06}.png")
         img.save(imgpath)
 
     latents = torch.cat([encode_image(data) for data in dataset[:100]['image']])
-    loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(latents), batch_size=args.train_batch_size, shuffle=True)
+    with torch.inference_mode():
+        loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(latents, decode_image(latents).cpu()), batch_size=args.train_batch_size, shuffle=True)
 
     # Encode the target text.
     text_ids = tokenizer(
@@ -342,19 +355,6 @@ def main():
     with torch.inference_mode():
         target_embeddings = text_encoder(text_ids)[0]
 
-    unconditioned_text_ids = tokenizer(
-        "",
-        padding="max_length",
-        truncation=True,
-        max_length=tokenizer.model_max_length,
-        return_tensors="pt",
-    ).input_ids
-
-    unconditioned_text_ids = unconditioned_text_ids.to(device=accelerator.device)
-    with torch.no_grad():
-        unconditioned_text_embeddings = text_encoder(unconditioned_text_ids)[0]
-    unconditioned_text_embeddings.requires_grad_(False)
-
     # Compute CLIP Loss
     valid_exts = [".png", ".jpg", ".jpeg"]
     file_list = [
@@ -363,8 +363,9 @@ def main():
         if os.path.splitext(file_name)[1].lower() in valid_exts
     ]
     with torch.inference_mode():
-        decode_images = decode_image(latents[:100]).permute(0, 3, 1, 2)
+        decode_images = decode_image(latents[:100]).cpu()
         clip_loss.set_img2img_direction(list(decode_images), file_list)
+        [save_logs(im, logging_dir, i, 'origin') for i, im in enumerate(decode_images[:10])]
 
     del text_encoder, dataset, decode_images
     if torch.cuda.is_available():
@@ -393,7 +394,7 @@ def main():
     def train_loop(pbar, optimizer):
         loss_avg = AverageMeter()
         for step in pbar:
-            init_latents = next(iter(loader))[0]
+            init_latents, origin_image = next(iter(loader))
             with accelerator.accumulate(unet):
                 noise = torch.randn_like(init_latents)
                 bsz = init_latents.shape[0]
@@ -406,13 +407,10 @@ def main():
                 with torch.no_grad():
                     noisy_latents = noise_scheduler.add_noise(init_latents, noise, torch.tensor([noise_scheduler.timesteps[-timesteps]] * bsz, device=accelerator.device))
 
-                    sample_origin = denoise(noisy_latents, args.train_inference_steps - timesteps, cond_embeddings=torch.cat([unconditioned_text_embeddings]*bsz))
-                    decode_origin = decode_image(sample_origin.to(dtype=weight_dtype))
-
-                sample_conditioned = denoise(noisy_latents, args.train_inference_steps - timesteps, cond_embeddings=torch.cat([optimized_embeddings]*bsz))
+                sample_conditioned = denoise_one_step(noisy_latents, args.train_inference_steps - timesteps - 1, cond_embeddings=torch.cat([optimized_embeddings]*bsz))
                 decode_conditioned = decode_image(sample_conditioned.to(dtype=weight_dtype))
 
-                loss = clip_loss(decode_origin, decode_conditioned)
+                loss = clip_loss(list(origin_image.to(device=accelerator.device)), list(decode_conditioned))
 
                 accelerator.backward(loss)
                 # if accelerator.sync_gradients:     # results aren't good with it, may be will need more training with it.
@@ -426,15 +424,15 @@ def main():
                 progress_bar.set_postfix(**logs)
                 accelerator.log(logs, step=step)
                 with torch.no_grad():
-                    samples = torch.cat([decode_origin, decode_conditioned], dim=-1).to("cpu")
+                    samples = torch.cat([decode_conditioned, origin_image.to(device=accelerator.device)], dim=-1).to("cpu")
                     samples = torch.cat(list(samples), dim=-2)
-                    save_logs(samples, args.logging_dir, step)
+                    save_logs(samples, logging_dir, step)
 
         accelerator.wait_for_everyone()
-    
+
     progress_bar = tqdm(range(args.emb_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Optimizing embedding")
-    
+
     train_loop(progress_bar, optimizer)
 
     optimized_embeddings.requires_grad_(False)
