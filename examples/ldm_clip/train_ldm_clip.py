@@ -195,6 +195,11 @@ def get_full_repo_name(model_id: str, organization: Optional[str] = None, token:
         return f"{organization}/{model_id}"
 
 
+def freeze_params(params):
+    for param in params:
+        param.requires_grad = False
+
+
 def main():
     args = parse_args()
     logging_dir = Path(args.output_dir, args.logging_dir)
@@ -243,6 +248,9 @@ def main():
     vae.eval()
     unet.eval()
     text_encoder.eval()
+    freeze_params(vae.parameters())
+    freeze_params(unet.parameters())
+    freeze_params(text_encoder.parameters())
 
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
@@ -282,6 +290,7 @@ def main():
     text_encoder.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
     clip.to(accelerator.device, dtype=weight_dtype)
+    unet.to(accelerator.device)
 
     # Encode the input image.
     if args.target_dataset == "Imagenet":
@@ -299,7 +308,7 @@ def main():
     def encode_image(image):
         image_tensor = image_transforms(image)
         image_tensor = image_tensor[None].to(device=accelerator.device, dtype=weight_dtype)
-        with torch.inference_mode():
+        with torch.no_grad():
             image_latents = vae.encode(image_tensor).latent_dist.sample()
             image_latents = 0.18215 * image_latents
         return image_latents
@@ -342,9 +351,10 @@ def main():
         imgpath = os.path.join(path, f"{key}_step_{step:06}.png")
         img.save(imgpath)
 
-    latents = torch.cat([encode_image(data) for data in dataset[:100]['image']])
-    with torch.inference_mode():
-        loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(latents, decode_image(latents).cpu()), batch_size=args.train_batch_size, shuffle=True)
+    with torch.no_grad():
+        latents = torch.cat([encode_image(data) for data in dataset[:100]['image']]).to(dtype=weight_dtype)
+        decode_images = torch.cat([decode_image(l[None]).cpu() for l in latents])
+        loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(latents, decode_images), batch_size=args.train_batch_size, shuffle=True)
 
     # Encode the target text.
     text_ids = tokenizer(
@@ -356,7 +366,7 @@ def main():
     ).input_ids
 
     text_ids = text_ids.to(device=accelerator.device)
-    with torch.inference_mode():
+    with torch.no_grad():
         target_embeddings = text_encoder(text_ids)[0]
 
     # Compute CLIP Loss
@@ -366,17 +376,15 @@ def main():
         for file_name in os.listdir(args.style_img_dir)
         if os.path.splitext(file_name)[1].lower() in valid_exts
     ]
-    with torch.inference_mode():
-        decode_images = decode_image(latents[:100]).cpu()
+    with torch.no_grad():
         clip_loss.set_img2img_direction(list(decode_images), file_list)
         [save_logs(im, logging_dir, i, 'origin') for i, im in enumerate(decode_images[:10])]
 
-    del text_encoder, dataset, decode_images
+    del text_encoder, dataset, decode_images, latents
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    target_embeddings = target_embeddings.float()
-    optimized_embeddings = target_embeddings.clone()
+    optimized_embeddings = target_embeddings.clone().float()
 
     # Optimize the text embeddings first.
     optimized_embeddings.requires_grad_(True)
@@ -388,7 +396,7 @@ def main():
         eps=args.adam_epsilon,
     )
 
-    unet, vae, optimizer, clip_loss, loader = accelerator.prepare(unet, vae, optimizer, clip_loss, loader)
+    optimizer, clip_loss, loader, optimized_embeddings = accelerator.prepare(optimizer, clip_loss, loader, optimized_embeddings)
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
@@ -399,38 +407,41 @@ def main():
         loss_avg = AverageMeter()
         for step in pbar:
             init_latents, origin_image = next(iter(loader))
-            with accelerator.accumulate(optimized_embeddings):
-                noise = torch.randn_like(init_latents)
-                bsz = init_latents.shape[0]
-                # Sample a random timestep for each image
-                timesteps = torch.randint(0, args.train_inference_steps, (1,), device=accelerator.device)
-                timesteps = timesteps.long()
+            init_latents = init_latents.to(device=accelerator.device)
+            origin_image = origin_image.to(device=accelerator.device)
+            with accelerator.autocast():
+                with accelerator.accumulate(unet):
+                    noise = torch.randn_like(init_latents)
+                    bsz = init_latents.shape[0]
+                    # Sample a random timestep for each image
+                    timesteps = torch.randint(0, args.train_inference_steps, (1,), device=accelerator.device)
+                    timesteps = timesteps.long()
 
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                with torch.no_grad():
-                    noisy_latents = noise_scheduler.add_noise(init_latents, noise, torch.tensor([noise_scheduler.timesteps[-timesteps]] * bsz, device=accelerator.device))
+                    # Add noise to the latents according to the noise magnitude at each timestep
+                    # (this is the forward diffusion process)
+                    with torch.no_grad():
+                        noisy_latents = noise_scheduler.add_noise(init_latents, noise, torch.tensor([noise_scheduler.timesteps[-timesteps]] * bsz, device=accelerator.device))
 
-                sample_conditioned = denoise_one_step(noisy_latents, args.train_inference_steps - timesteps - 1, cond_embeddings=torch.cat([optimized_embeddings]*bsz))
-                decode_conditioned = decode_image(sample_conditioned.to(dtype=weight_dtype))
+                    sample_conditioned = denoise_one_step(noisy_latents, args.train_inference_steps - timesteps - 1, cond_embeddings=torch.cat([optimized_embeddings]*bsz))
+                    decode_conditioned = decode_image(sample_conditioned.to(dtype=weight_dtype))
 
-                loss = clip_loss(list(origin_image.to(device=accelerator.device)), list(decode_conditioned))
+                    loss = clip_loss(list(origin_image), list(decode_conditioned))
 
-                accelerator.backward(loss)
-                # if accelerator.sync_gradients:     # results aren't good with it, may be will need more training with it.
-                #     accelerator.clip_grad_norm_(params, args.max_grad_norm)
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-                loss_avg.update(loss.detach_(), bsz)
+                    accelerator.backward(loss)
+                    # if accelerator.sync_gradients:     # results aren't good with it, may be will need more training with it.
+                    #     accelerator.clip_grad_norm_(params, args.max_grad_norm)
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    loss_avg.update(loss.detach_(), bsz)
 
-            if not step % args.log_interval:
-                logs = {"loss": loss_avg.avg.item()}
-                progress_bar.set_postfix(**logs)
-                accelerator.log(logs, step=step)
-                with torch.no_grad():
-                    samples = torch.cat([decode_conditioned, origin_image.to(device=accelerator.device)], dim=-1).to("cpu")
-                    samples = torch.cat(list(samples), dim=-2)
-                    save_logs(samples, logging_dir, step)
+                if not step % args.log_interval:
+                    logs = {"loss": loss_avg.avg.item()}
+                    progress_bar.set_postfix(**logs)
+                    accelerator.log(logs, step=step)
+                    with torch.no_grad():
+                        samples = torch.cat([decode_conditioned, origin_image.to(device=accelerator.device)], dim=-1).to("cpu")
+                        samples = torch.cat(list(samples), dim=-2)
+                        save_logs(samples, logging_dir, step)
 
         accelerator.wait_for_everyone()
 
