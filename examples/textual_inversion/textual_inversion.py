@@ -566,6 +566,7 @@ def main():
         # )
         # pipeline.save_pretrained(args.output_dir)
         # Also save the newly trained embeddings
+        tokenizer.save_pretrained(os.path.join(args.output_dir, 'tokenizer'))
         save_progress(text_encoder, placeholder_token_id, accelerator, args)
 
         if args.push_to_hub:
