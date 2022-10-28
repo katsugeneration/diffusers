@@ -240,6 +240,10 @@ def main():
     feature_extractor = CLIPFeatureExtractor.from_pretrained("openai/clip-vit-large-patch14")
     clip_loss = CLIPLoss(clip, feature_extractor)
 
+    vae.eval()
+    unet.eval()
+    text_encoder.eval()
+
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
 
@@ -395,7 +399,7 @@ def main():
         loss_avg = AverageMeter()
         for step in pbar:
             init_latents, origin_image = next(iter(loader))
-            with accelerator.accumulate(unet):
+            with accelerator.accumulate(optimized_embeddings):
                 noise = torch.randn_like(init_latents)
                 bsz = init_latents.shape[0]
                 # Sample a random timestep for each image
