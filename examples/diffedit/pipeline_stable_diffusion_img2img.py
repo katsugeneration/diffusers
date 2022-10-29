@@ -351,7 +351,7 @@ class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
         if diffedit_noise_ratio is not None:
             # get uncondition text embeddings
             unconditioned_text_inputs = self.tokenizer(
-                "",
+                "",  # TODO: prompt is enable to custom
                 padding="max_length",
                 max_length=self.tokenizer.model_max_length,
                 return_tensors="pt",
@@ -363,27 +363,21 @@ class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
             noise_ratio = torch.tensor(diffedit_noise_ratio)
             mask_threshold = 0.5
             mask_noise = torch.randn((noise_num, ) + init_latents.shape[1:], generator=generator, device=self.device, dtype=latents_dtype)
-            noised_latents = noise_ratio * init_latents[0][None] + (1 - noise_ratio) * mask_noise
+            noised_latents =  torch.sqrt(1 - noise_ratio) * init_latents[0][None] +  torch.sqrt(noise_ratio) * mask_noise
 
-            prev_latens = noised_latents.clone()
+            diffs = []
             for t in self.scheduler.timesteps:
-                noise_pred = self.unet(prev_latens, t, encoder_hidden_states=base_text_embeddings.repeat_interleave(noise_num, dim=0)).sample
-                prev_latens = self.scheduler.step(noise_pred, t, prev_latens, **extra_step_kwargs).prev_sample
-                conditioned_noise_pred = prev_latens
-
-            prev_latens = noised_latents.clone()
-            for t in self.scheduler.timesteps:
-                noise_pred = self.unet(prev_latens, t, encoder_hidden_states=unconditioned_text_embeddings.repeat_interleave(noise_num, dim=0)).sample
-                prev_latens = self.scheduler.step(noise_pred, t, prev_latens, **extra_step_kwargs).prev_sample
-                unconditioned_noise_pred = prev_latens
-
-            diff = torch.abs(conditioned_noise_pred - unconditioned_noise_pred).mean(dim=0)
-            diff_min = diff.float().quantile(0.3)
-            diff_max = diff.float().quantile(0.7)
+                conditioned_noise_pred = self.unet(noised_latents, t, encoder_hidden_states=base_text_embeddings.repeat_interleave(noise_num, dim=0)).sample
+                unconditioned_noise_pred = self.unet(noised_latents, t, encoder_hidden_states=unconditioned_text_embeddings.repeat_interleave(noise_num, dim=0)).sample
+                diff = torch.abs(conditioned_noise_pred - unconditioned_noise_pred).mean(dim=0)
+                diffs.append(diff)
+            diff = torch.stack(diffs).mean(dim=[0, 1])
+            diff_min = diff.float().quantile(0.01)
+            diff_max = diff.float().quantile(0.99)
             diff = diff.clamp(diff_min, diff_max)
             diff -= diff.min()
             diff /= diff.max()
-            mask = (diff > mask_threshold).any(dim=0).to(dtype=torch.uint8)
+            mask = (diff > mask_threshold).to(dtype=torch.uint8)
 
             for t in timesteps:
                 noisy_samples[t.item()] = self.scheduler.add_noise(init_latents, noise, t)
