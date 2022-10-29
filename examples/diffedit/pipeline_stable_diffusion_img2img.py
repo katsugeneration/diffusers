@@ -137,6 +137,7 @@ class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
         init_image: Union[torch.FloatTensor, PIL.Image.Image],
         strength: float = 0.8,
         diffedit_noise_ratio: Optional[float] = None,
+        diffedit_reference_text: str = "",
         num_inference_steps: Optional[int] = 50,
         guidance_scale: Optional[float] = 7.5,
         negative_prompt: Optional[Union[str, List[str]]] = None,
@@ -165,7 +166,9 @@ class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
                 noise will be maximum and the denoising process will run for the full number of iterations specified in
                 `num_inference_steps`. A value of 1, therefore, essentially ignores `init_image`.
             diffedit_noise_ratio (`float`, *optional*, defaults to None):
-                Noise ratio for DiffEdit mask compute. None means do not use DiffEdit. official experiments value is 0.5. 
+                Noise ratio for DiffEdit mask compute. None means do not use DiffEdit. official experiments value is 0.5.
+            diffedit_reference_text (`str`, *optional*, defaults to ""):
+                Reference text for Diffedit mask compute. Reference text must be paired to prompt text.
             num_inference_steps (`int`, *optional*, defaults to 50):
                 The number of denoising steps. More denoising steps usually lead to a higher quality image at the
                 expense of slower inference. This parameter will be modulated by `strength`.
@@ -351,7 +354,7 @@ class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
         if diffedit_noise_ratio is not None:
             # get uncondition text embeddings
             unconditioned_text_inputs = self.tokenizer(
-                "",  # TODO: prompt is enable to custom
+                diffedit_reference_text,
                 padding="max_length",
                 max_length=self.tokenizer.model_max_length,
                 return_tensors="pt",
@@ -363,7 +366,7 @@ class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
             noise_ratio = torch.tensor(diffedit_noise_ratio)
             mask_threshold = 0.5
             mask_noise = torch.randn((noise_num, ) + init_latents.shape[1:], generator=generator, device=self.device, dtype=latents_dtype)
-            noised_latents =  torch.sqrt(1 - noise_ratio) * init_latents[0][None] +  torch.sqrt(noise_ratio) * mask_noise
+            noised_latents = torch.sqrt(1 - noise_ratio) * init_latents[0][None] +  torch.sqrt(noise_ratio) * mask_noise
 
             diffs = []
             for t in self.scheduler.timesteps:
