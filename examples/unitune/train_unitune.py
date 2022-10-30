@@ -279,11 +279,11 @@ def main():
 
     init_image = image_transforms(input_image)
     init_image = init_image[None].to(device=accelerator.device, dtype=weight_dtype)
-    with torch.inference_mode():
+    with torch.no_grad():
         init_latents = vae.encode(init_image).latent_dist.sample()
         init_latents = 0.18215 * init_latents
 
-    num_added_tokens = tokenizer.add_tokens(args.placeholder_tokens.split(','))
+    num_added_tokens = tokenizer.add_tokens(args.placeholder_tokens.split(' '))
     if num_added_tokens == 0:
         raise ValueError(
             f"The tokenizer already contains the token {args.placeholder_token}. Please pass a different"
@@ -294,19 +294,13 @@ def main():
     text_encoder.resize_token_embeddings(len(tokenizer))
 
     # Encode the target text.
-    text_ids = tokenizer(
-        args.placeholder_tokens,
-        padding="max_length",
-        truncation=True,
-        max_length=tokenizer.model_max_length,
-        return_tensors="pt",
-    ).input_ids
+    placeholder_token_ids = tokenizer.convert_tokens_to_ids(args.placeholder_tokens.split())
 
-    text_ids = text_ids.to(device=accelerator.device)
-    with torch.inference_mode():
-        target_embeddings = text_encoder(text_ids)[0]
+    placeholder_token_ids = torch.tensor([placeholder_token_ids]).to(device=accelerator.device)
+    with torch.no_grad():
+        target_embeddings = text_encoder(placeholder_token_ids)[0]
 
-    del vae, text_encoder
+    del vae
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -347,9 +341,6 @@ def main():
 
         accelerator.wait_for_everyone()
 
-    progress_bar = tqdm(range(args.emb_train_steps), disable=not accelerator.is_local_main_process)
-    progress_bar.set_description("Optimizing embedding")
-
     # Fine tune the diffusion model.
     optimizer = optimizer_class(
         unet.parameters(),
@@ -358,8 +349,6 @@ def main():
         # weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
-    optimizer = accelerator.prepare(optimizer)
-
     unet, optimizer = accelerator.prepare(unet, optimizer)
 
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
@@ -373,6 +362,8 @@ def main():
         pipeline = StableDiffusionPipeline.from_pretrained(
             args.pretrained_model_name_or_path,
             unet=accelerator.unwrap_model(unet),
+            tokenizer=tokenizer,
+            text_encoder=text_encoder,
             use_auth_token=True
         )
         pipeline.save_pretrained(args.output_dir)
