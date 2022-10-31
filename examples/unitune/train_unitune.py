@@ -50,7 +50,7 @@ def parse_args():
         type=str,
         default=None,
         required=True,
-        help="comma separated tokens.",
+        help="space separated tokens.",
     )
     parser.add_argument(
         "--output_dir",
