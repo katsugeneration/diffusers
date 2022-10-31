@@ -78,6 +78,15 @@ def parse_args():
         default="text-inversion-model",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="The resume directory for tokenizer and text embedding.",
+    )
+    parser.add_argument(
+        "--train_unet", action="store_true", help="Whether to train unet"
+    )
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument(
         "--resolution",
@@ -101,6 +110,13 @@ def parse_args():
         default=5000,
         help="Total number of training steps to perform.  If provided, overrides num_train_epochs.",
     )
+    parser.add_argument("--unet_num_train_epochs", type=int, default=100)
+    parser.add_argument(
+        "--unet_max_train_steps",
+        type=int,
+        default=64,
+        help="Total number of training steps to perform.  If provided, overrides num_train_epochs.",
+    )
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
@@ -109,6 +125,12 @@ def parse_args():
     )
     parser.add_argument(
         "--learning_rate",
+        type=float,
+        default=1e-4,
+        help="Initial learning rate (after the potential warmup period) to use.",
+    )
+    parser.add_argument(
+        "--unet_learning_rate",
         type=float,
         default=1e-4,
         help="Initial learning rate (after the potential warmup period) to use.",
@@ -362,24 +384,28 @@ def main():
     # Load the tokenizer and add the placeholder token as a additional special token
     if args.tokenizer_name:
         tokenizer = CLIPTokenizer.from_pretrained(args.tokenizer_name)
+    elif args.resume:
+        tokenizer = CLIPTokenizer.from_pretrained(args.resume, subfolder="tokenizer")
     elif args.pretrained_model_name_or_path:
         tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
 
     # Add the placeholder token in tokenizer
-    num_added_tokens = tokenizer.add_tokens(args.placeholder_token)
-    if num_added_tokens == 0:
-        raise ValueError(
-            f"The tokenizer already contains the token {args.placeholder_token}. Please pass a different"
-            " `placeholder_token` that is not already in the tokenizer."
-        )
+    if args.resume is None:
+        num_added_tokens = tokenizer.add_tokens(args.placeholder_token)
+        if num_added_tokens == 0:
+            raise ValueError(
+                f"The tokenizer already contains the token {args.placeholder_token}. Please pass a different"
+                " `placeholder_token` that is not already in the tokenizer."
+            )
 
-    # Convert the initializer_token, placeholder_token to ids
-    token_ids = tokenizer.encode(args.initializer_token, add_special_tokens=False)
-    # Check if initializer_token is a single token or a sequence of tokens
-    if len(token_ids) > 1:
-        raise ValueError("The initializer token must be a single token.")
+    if args.resume is None:
+        # Convert the initializer_token, placeholder_token to ids
+        token_ids = tokenizer.encode(args.initializer_token, add_special_tokens=False)
+        # Check if initializer_token is a single token or a sequence of tokens
+        if len(token_ids) > 1:
+            raise ValueError("The initializer token must be a single token.")
 
-    initializer_token_id = token_ids[0]
+        initializer_token_id = token_ids[0]
     placeholder_token_id = tokenizer.convert_tokens_to_ids(args.placeholder_token)
 
     # Load models and create wrapper for stable diffusion
@@ -392,32 +418,30 @@ def main():
 
     # Initialise the newly added placeholder token with the embeddings of the initializer token
     token_embeds = text_encoder.get_input_embeddings().weight.data
-    token_embeds[placeholder_token_id] = token_embeds[initializer_token_id]
+    if args.resume is None:
+        token_embeds[placeholder_token_id] = token_embeds[initializer_token_id]
+    else:
+        token_embeds.weight.data[placeholder_token_id] = torch.load(os.path.join(args.resume, "learned_embeds.bin"))[args.placeholder_token]
 
     # Freeze vae and unet
     freeze_params(vae.parameters())
-    freeze_params(unet.parameters())
-    # Freeze all parameters except for the token embeddings in text encoder
-    params_to_freeze = itertools.chain(
-        text_encoder.text_model.encoder.parameters(),
-        text_encoder.text_model.final_layer_norm.parameters(),
-        text_encoder.text_model.embeddings.position_embedding.parameters(),
-    )
-    freeze_params(params_to_freeze)
+    if args.resume is None:
+        # Freeze all parameters except for the token embeddings in text encoder
+        params_to_freeze = itertools.chain(
+            text_encoder.text_model.encoder.parameters(),
+            text_encoder.text_model.final_layer_norm.parameters(),
+            text_encoder.text_model.embeddings.position_embedding.parameters(),
+        )
+        freeze_params(params_to_freeze)
+    else:
+        freeze_params(text_encoder.parameters())
+    if not args.train_unet:
+        freeze_params(unet.parameters())
 
     if args.scale_lr:
         args.learning_rate = (
             args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
         )
-
-    # Initialize the optimizer
-    optimizer = torch.optim.AdamW(
-        text_encoder.get_input_embeddings().parameters(),  # only optimize the embeddings
-        lr=args.learning_rate,
-        betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon,
-    )
 
     # TODO (patil-suraj): load scheduler using args
     noise_scheduler = DDPMScheduler(
@@ -446,24 +470,10 @@ def main():
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
 
-    lr_scheduler = get_scheduler(
-        args.lr_scheduler,
-        optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
-        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
-    )
-
-    text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        text_encoder, optimizer, train_dataloader, lr_scheduler
-    )
-
     # Move vae and unet to device
     vae.to(accelerator.device)
     unet.to(accelerator.device)
-
-    # Keep vae and unet in eval model as we don't train these
-    vae.eval()
-    unet.eval()
+    text_encoder.to(accelerator.device)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -477,6 +487,95 @@ def main():
     if accelerator.is_main_process:
         accelerator.init_trackers("textual_inversion", config=vars(args))
 
+    def train_loop(target, num_epochs):
+        # Only show the progress bar once on each machine.
+        progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
+        progress_bar.set_description("Steps")
+        global_step = 0
+
+        for epoch in range(num_epochs):
+            target.train()
+            for step, batch in enumerate(train_dataloader):
+                with accelerator.accumulate(target):
+                    # Convert images to latent space
+                    latents = vae.encode(batch["pixel_values"]).latent_dist.sample().detach()
+                    latents = latents * 0.18215
+
+                    # Sample noise that we'll add to the latents
+                    noise = torch.randn(latents.shape).to(latents.device)
+                    bsz = latents.shape[0]
+                    # Sample a random timestep for each image
+                    timesteps = torch.randint(
+                        0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device
+                    ).long()
+
+                    # Add noise to the latents according to the noise magnitude at each timestep
+                    # (this is the forward diffusion process)
+                    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+                    # Get the text embedding for conditioning
+                    encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+
+                    # Predict the noise residual
+                    noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+
+                    loss = F.mse_loss(noise_pred, noise, reduction="none").mean([1, 2, 3]).mean()
+                    accelerator.backward(loss)
+
+                    # Zero out the gradients for all token embeddings except the newly added
+                    # embeddings for the concept, as we only want to optimize the concept embeddings
+                    if accelerator.num_processes > 1:
+                        grads = text_encoder.module.get_input_embeddings().weight.grad
+                    else:
+                        grads = text_encoder.get_input_embeddings().weight.grad
+                    # Get the index for tokens that we want to zero the grads for
+                    index_grads_to_zero = torch.arange(len(tokenizer)) != placeholder_token_id
+                    grads.data[index_grads_to_zero, :] = grads.data[index_grads_to_zero, :].fill_(0)
+
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
+
+                # Checks if the accelerator has performed an optimization step behind the scenes
+                if accelerator.sync_gradients:
+                    progress_bar.update(1)
+                    global_step += 1
+                    if global_step % args.save_steps == 0:
+                        save_progress(text_encoder, placeholder_token_id, accelerator, args)
+
+                logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+                progress_bar.set_postfix(**logs)
+                accelerator.log(logs, step=global_step)
+
+                if global_step >= args.max_train_steps:
+                    break
+
+            accelerator.wait_for_everyone()
+
+    # Keep vae and unet in eval model as we don't train these
+    vae.eval()
+    unet.eval()
+
+    # Initialize the optimizer
+    optimizer = torch.optim.AdamW(
+        text_encoder.get_input_embeddings().parameters(),  # only optimize the embeddings
+        lr=args.learning_rate,
+        betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.adam_weight_decay,
+        eps=args.adam_epsilon,
+    )
+
+    lr_scheduler = get_scheduler(
+        args.lr_scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
+        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+    )
+
+    text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        text_encoder, optimizer, train_dataloader, lr_scheduler
+    )
+
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
@@ -487,87 +586,64 @@ def main():
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
-    # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
-    progress_bar.set_description("Steps")
-    global_step = 0
 
-    for epoch in range(args.num_train_epochs):
-        text_encoder.train()
-        for step, batch in enumerate(train_dataloader):
-            with accelerator.accumulate(text_encoder):
-                # Convert images to latent space
-                latents = vae.encode(batch["pixel_values"]).latent_dist.sample().detach()
-                latents = latents * 0.18215
-
-                # Sample noise that we'll add to the latents
-                noise = torch.randn(latents.shape).to(latents.device)
-                bsz = latents.shape[0]
-                # Sample a random timestep for each image
-                timesteps = torch.randint(
-                    0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device
-                ).long()
-
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-                # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
-
-                # Predict the noise residual
-                noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-
-                loss = F.mse_loss(noise_pred, noise, reduction="none").mean([1, 2, 3]).mean()
-                accelerator.backward(loss)
-
-                # Zero out the gradients for all token embeddings except the newly added
-                # embeddings for the concept, as we only want to optimize the concept embeddings
-                if accelerator.num_processes > 1:
-                    grads = text_encoder.module.get_input_embeddings().weight.grad
-                else:
-                    grads = text_encoder.get_input_embeddings().weight.grad
-                # Get the index for tokens that we want to zero the grads for
-                index_grads_to_zero = torch.arange(len(tokenizer)) != placeholder_token_id
-                grads.data[index_grads_to_zero, :] = grads.data[index_grads_to_zero, :].fill_(0)
-
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
-
-            # Checks if the accelerator has performed an optimization step behind the scenes
-            if accelerator.sync_gradients:
-                progress_bar.update(1)
-                global_step += 1
-                if global_step % args.save_steps == 0:
-                    save_progress(text_encoder, placeholder_token_id, accelerator, args)
-
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
-            progress_bar.set_postfix(**logs)
-            accelerator.log(logs, step=global_step)
-
-            if global_step >= args.max_train_steps:
-                break
-
-        accelerator.wait_for_everyone()
-
-    # Create the pipeline using using the trained modules and save it.
+    train_loop(text_encoder, args.num_train_epochs)
     if accelerator.is_main_process:
-        # pipeline = StableDiffusionPipeline(
-        #     text_encoder=accelerator.unwrap_model(text_encoder),
-        #     vae=vae,
-        #     unet=unet,
-        #     tokenizer=tokenizer,
-        #     scheduler=PNDMScheduler(
-        #         beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", skip_prk_steps=True
-        #     ),
-        #     safety_checker=StableDiffusionSafetyChecker.from_pretrained("CompVis/stable-diffusion-safety-checker"),
-        #     feature_extractor=CLIPFeatureExtractor.from_pretrained("openai/clip-vit-base-patch32"),
-        # )
-        # pipeline.save_pretrained(args.output_dir)
-        # Also save the newly trained embeddings
         tokenizer.save_pretrained(os.path.join(args.output_dir, 'tokenizer'))
         save_progress(text_encoder, placeholder_token_id, accelerator, args)
+
+    if args.train_unet:
+        # Keep vae and unet in eval model as we don't train these
+        unet.train()
+        text_encoder.train()
+
+        # Initialize the optimizer
+        optimizer = torch.optim.AdamW(
+            unet.parameters(),  # only optimize the embeddings
+            lr=args.unet_learning_rate,
+            betas=(args.adam_beta1, args.adam_beta2),
+            weight_decay=args.adam_weight_decay,
+            eps=args.adam_epsilon,
+        )
+
+        lr_scheduler = get_scheduler(
+            args.lr_scheduler,
+            optimizer=optimizer,
+            num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
+            num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+        )
+
+        unet, optimizer, lr_scheduler = accelerator.prepare(
+            unet, optimizer, lr_scheduler
+        )
+
+        # We need to recalculate our total training steps as the size of the training dataloader may have changed.
+        num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+        if overrode_max_train_steps:
+            args.unet_max_train_steps = args.unet_num_train_epochs * num_update_steps_per_epoch
+        # Afterwards we recalculate our number of training epochs
+        args.unet_num_train_epochs = math.ceil(args.unet_max_train_steps / num_update_steps_per_epoch)
+
+        logger.info("***** Running training *****")
+        logger.info(f"  Num Epochs = {args.unet_num_train_epochs}")
+        logger.info(f"  Total optimization steps = {args.unet_max_train_steps}")
+
+        train_loop(unet, args.unet_num_train_epochs)
+
+        # Create the pipeline using using the trained modules and save it.
+        if accelerator.is_main_process:
+            pipeline = StableDiffusionPipeline(
+                text_encoder=accelerator.unwrap_model(text_encoder),
+                vae=vae,
+                unet=unet,
+                tokenizer=accelerator.unwrap_model(tokenizer),
+                scheduler=PNDMScheduler(
+                    beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", skip_prk_steps=True
+                ),
+                safety_checker=StableDiffusionSafetyChecker.from_pretrained("CompVis/stable-diffusion-safety-checker"),
+                feature_extractor=CLIPFeatureExtractor.from_pretrained("openai/clip-vit-base-patch32"),
+            )
+            pipeline.save_pretrained(args.output_dir)
 
         if args.push_to_hub:
             repo.push_to_hub(commit_message="End of training", blocking=False, auto_lfs_prune=True)
