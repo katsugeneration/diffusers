@@ -103,6 +103,11 @@ def parse_args():
     parser.add_argument(
         "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
     )
+    parser.add_argument(
+        "--gradient_checkpointing",
+        action="store_true",
+        help="Whether or not to use gradient checkpointing to save memory at the expense of slower backward pass.",
+    )
     parser.add_argument("--num_train_epochs", type=int, default=100)
     parser.add_argument(
         "--max_train_steps",
@@ -134,6 +139,9 @@ def parse_args():
         type=float,
         default=1e-4,
         help="Initial learning rate (after the potential warmup period) to use.",
+    )
+    parser.add_argument(
+        "--use_8bit_adam", action="store_true", help="Whether or not to use 8-bit Adam from bitsandbytes."
     )
     parser.add_argument(
         "--scale_lr",
@@ -421,7 +429,7 @@ def main():
     if args.resume is None:
         token_embeds[placeholder_token_id] = token_embeds[initializer_token_id]
     else:
-        token_embeds.weight.data[placeholder_token_id] = torch.load(os.path.join(args.resume, "learned_embeds.bin"))[args.placeholder_token]
+        token_embeds[placeholder_token_id] = torch.load(os.path.join(args.resume, "learned_embeds.bin"))[args.placeholder_token]
 
     # Freeze vae and unet
     freeze_params(vae.parameters())
@@ -475,6 +483,9 @@ def main():
     unet.to(accelerator.device)
     text_encoder.to(accelerator.device)
 
+    if args.gradient_checkpointing:
+        unet.enable_gradient_checkpointing()
+
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
@@ -487,9 +498,9 @@ def main():
     if accelerator.is_main_process:
         accelerator.init_trackers("textual_inversion", config=vars(args))
 
-    def train_loop(target, num_epochs):
+    def train_loop(target, num_epochs, train_steps):
         # Only show the progress bar once on each machine.
-        progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
+        progress_bar = tqdm(range(train_steps), disable=not accelerator.is_local_main_process)
         progress_bar.set_description("Steps")
         global_step = 0
 
@@ -498,7 +509,7 @@ def main():
             for step, batch in enumerate(train_dataloader):
                 with accelerator.accumulate(target):
                     # Convert images to latent space
-                    latents = vae.encode(batch["pixel_values"]).latent_dist.sample().detach()
+                    latents = vae.encode(batch["pixel_values"].to(accelerator.device)).latent_dist.sample().detach()
                     latents = latents * 0.18215
 
                     # Sample noise that we'll add to the latents
@@ -514,7 +525,7 @@ def main():
                     noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                     # Get the text embedding for conditioning
-                    encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                    encoder_hidden_states = text_encoder(batch["input_ids"].to(accelerator.device))[0]
 
                     # Predict the noise residual
                     noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
@@ -528,9 +539,10 @@ def main():
                         grads = text_encoder.module.get_input_embeddings().weight.grad
                     else:
                         grads = text_encoder.get_input_embeddings().weight.grad
-                    # Get the index for tokens that we want to zero the grads for
-                    index_grads_to_zero = torch.arange(len(tokenizer)) != placeholder_token_id
-                    grads.data[index_grads_to_zero, :] = grads.data[index_grads_to_zero, :].fill_(0)
+                    if grads is not None:
+                        # Get the index for tokens that we want to zero the grads for
+                        index_grads_to_zero = torch.arange(len(tokenizer)) != placeholder_token_id
+                        grads.data[index_grads_to_zero, :] = grads.data[index_grads_to_zero, :].fill_(0)
 
                     optimizer.step()
                     lr_scheduler.step()
@@ -547,60 +559,36 @@ def main():
                 progress_bar.set_postfix(**logs)
                 accelerator.log(logs, step=global_step)
 
-                if global_step >= args.max_train_steps:
+                if global_step >= train_steps:
                     break
 
             accelerator.wait_for_everyone()
 
-    # Keep vae and unet in eval model as we don't train these
-    vae.eval()
-    unet.eval()
+    # Use 8-bit Adam for lower memory usage or to fine-tune the model in 16GB GPUs
+    if args.use_8bit_adam:
+        try:
+            import bitsandbytes as bnb
+        except ImportError:
+            raise ImportError(
+                "To use 8-bit Adam, please install the bitsandbytes library: `pip install bitsandbytes`."
+            )
 
-    # Initialize the optimizer
-    optimizer = torch.optim.AdamW(
-        text_encoder.get_input_embeddings().parameters(),  # only optimize the embeddings
-        lr=args.learning_rate,
-        betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon,
-    )
-
-    lr_scheduler = get_scheduler(
-        args.lr_scheduler,
-        optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
-        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
-    )
-
-    text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        text_encoder, optimizer, train_dataloader, lr_scheduler
-    )
+        optimizer_class = bnb.optim.Adam8bit
+    else:
+        optimizer_class = torch.optim.Adam
 
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
-    logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    logger.info(f"  Total optimization steps = {args.max_train_steps}")
-
-    train_loop(text_encoder, args.num_train_epochs)
-    if accelerator.is_main_process:
-        tokenizer.save_pretrained(os.path.join(args.output_dir, 'tokenizer'))
-        save_progress(text_encoder, placeholder_token_id, accelerator, args)
-
-    if args.train_unet:
+    if args.resume is None:
         # Keep vae and unet in eval model as we don't train these
-        unet.train()
-        text_encoder.train()
+        vae.eval()
+        unet.eval()
 
         # Initialize the optimizer
-        optimizer = torch.optim.AdamW(
-            unet.parameters(),  # only optimize the embeddings
-            lr=args.unet_learning_rate,
+        optimizer = optimizer_class(
+            text_encoder.get_input_embeddings().parameters(),  # only optimize the embeddings
+            lr=args.learning_rate,
             betas=(args.adam_beta1, args.adam_beta2),
             weight_decay=args.adam_weight_decay,
             eps=args.adam_epsilon,
@@ -613,22 +601,57 @@ def main():
             num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
         )
 
-        unet, optimizer, lr_scheduler = accelerator.prepare(
-            unet, optimizer, lr_scheduler
+        text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            text_encoder, optimizer, train_dataloader, lr_scheduler
+        )
+
+        logger.info("***** Running training *****")
+        logger.info(f"  Num examples = {len(train_dataset)}")
+        logger.info(f"  Num Epochs = {args.num_train_epochs}")
+        logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
+        logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+        logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+        logger.info(f"  Total optimization steps = {args.max_train_steps}")
+
+        train_loop(text_encoder, args.num_train_epochs, args.max_train_steps)
+        if accelerator.is_main_process:
+            tokenizer.save_pretrained(os.path.join(args.output_dir, 'tokenizer'))
+            save_progress(text_encoder, placeholder_token_id, accelerator, args)
+
+    if args.train_unet:
+        # Keep vae and unet in eval model as we don't train these
+        unet.train()
+        text_encoder.train()
+
+        # Initialize the optimizer
+        optimizer = optimizer_class(
+            unet.parameters(),  # only optimize the embeddings
+            lr=args.unet_learning_rate,
+            betas=(args.adam_beta1, args.adam_beta2),
+            weight_decay=args.adam_weight_decay,
+            eps=args.adam_epsilon,
         )
 
         # We need to recalculate our total training steps as the size of the training dataloader may have changed.
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-        if overrode_max_train_steps:
-            args.unet_max_train_steps = args.unet_num_train_epochs * num_update_steps_per_epoch
-        # Afterwards we recalculate our number of training epochs
         args.unet_num_train_epochs = math.ceil(args.unet_max_train_steps / num_update_steps_per_epoch)
+
+        lr_scheduler = get_scheduler(
+            args.lr_scheduler,
+            optimizer=optimizer,
+            num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
+            num_training_steps=args.unet_max_train_steps * args.gradient_accumulation_steps,
+        )
+
+        unet, optimizer, lr_scheduler = accelerator.prepare(
+            unet, optimizer, lr_scheduler
+        )
 
         logger.info("***** Running training *****")
         logger.info(f"  Num Epochs = {args.unet_num_train_epochs}")
         logger.info(f"  Total optimization steps = {args.unet_max_train_steps}")
 
-        train_loop(unet, args.unet_num_train_epochs)
+        train_loop(unet, args.unet_num_train_epochs, args.unet_max_train_steps)
 
         # Create the pipeline using using the trained modules and save it.
         if accelerator.is_main_process:
