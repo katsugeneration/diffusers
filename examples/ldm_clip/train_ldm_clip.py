@@ -161,6 +161,7 @@ def parse_args():
         ),
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
+    parser.add_argument("--ddim_steps", type=int, default=50, help="DDIM steps")
     parser.add_argument("--train_inference_steps", type=int, default=50, help="DDIM steps")
 
     args = parser.parse_args()
@@ -243,18 +244,16 @@ def main():
     unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet", use_auth_token=True)
     clip = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
     feature_extractor = CLIPFeatureExtractor.from_pretrained("openai/clip-vit-large-patch14")
-    clip_loss = CLIPLoss(clip, feature_extractor)
+    clip_loss = CLIPLoss(clip, feature_extractor, tokenizer)
 
     vae.eval()
-    unet.eval()
+    unet.train()
     text_encoder.eval()
     freeze_params(vae.parameters())
-    freeze_params(unet.parameters())
     freeze_params(text_encoder.parameters())
 
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
-        vae.enable_gradient_checkpointing()
 
     if args.scale_lr:
         args.learning_rate = (
@@ -277,7 +276,7 @@ def main():
     noise_scheduler = DDIMScheduler(
         beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000
     )
-    noise_scheduler.set_timesteps(args.train_inference_steps)
+    noise_scheduler.set_timesteps(args.ddim_steps)
 
     weight_dtype = torch.float32
     if args.mixed_precision == "fp16":
@@ -324,11 +323,8 @@ def main():
         timesteps = noise_scheduler.timesteps[t_start:].to(accelerator.device)
 
         for i, t in enumerate(timesteps):
-            # expand the latents if we are doing classifier free guidance
-            latent_model_input = noise_scheduler.scale_model_input(latents, t)
-
             # predict the noise residual
-            noise_pred = unet(latent_model_input, t, encoder_hidden_states=cond_embeddings).sample
+            noise_pred = unet(latents, t, encoder_hidden_states=cond_embeddings).sample
 
             # compute the previous noisy sample x_t -> x_t-1
             latents = noise_scheduler.step(noise_pred, t, latents).prev_sample
@@ -358,7 +354,12 @@ def main():
         loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(latents, decode_images), batch_size=args.train_batch_size, shuffle=True)
 
     # Encode the target text.
-    text_ids = torch.tensor([tokenizer.convert_tokens_to_ids(args.target_text)])
+    text_ids = tokenizer(
+        args.target_text,
+        padding="max_length",
+        max_length=tokenizer.model_max_length,
+        return_tensors="pt",
+    ).input_ids
 
     text_ids = text_ids.to(device=accelerator.device)
     with torch.no_grad():
@@ -367,8 +368,6 @@ def main():
     # Compute CLIP Loss
     with torch.no_grad():
         clip_loss.set_txt2txt_direction(args.source_text, args.target_text)
-
-    [save_logs(im, logging_dir, i, 'origin') for i, im in enumerate(decode_images[:10])]
 
     del text_encoder, dataset, decode_images, latents
     if torch.cuda.is_available():
@@ -392,7 +391,7 @@ def main():
                     noise = torch.randn_like(init_latents)
                     bsz = init_latents.shape[0]
                     # Sample a random timestep for each image
-                    timesteps = torch.randint(0, args.train_inference_steps, (1,), device=accelerator.device)
+                    timesteps = torch.tensor(args.train_inference_steps, device=accelerator.device)
                     timesteps = timesteps.long()
 
                     # Add noise to the latents according to the noise magnitude at each timestep
@@ -431,15 +430,14 @@ def main():
         # weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
-    optimizer = accelerator.prepare(optimizer)
+    unet, optimizer = accelerator.prepare(unet, optimizer)
 
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Fine Tuning")
-    unet.train()
 
     train_loop(progress_bar, optimizer)
 
-    Create the pipeline using using the trained modules and save it.
+    # Create the pipeline using using the trained modules and save it.
     if accelerator.is_main_process:
         pipeline = StableDiffusionPipeline.from_pretrained(
             args.pretrained_model_name_or_path,
