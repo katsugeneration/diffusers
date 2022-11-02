@@ -83,15 +83,9 @@ def parse_args():
         "--train_batch_size", type=int, default=4, help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument(
-        "--emb_train_steps",
-        type=int,
-        default=500,
-        help="Total number of training steps to perform.",
-    )
-    parser.add_argument(
         "--max_train_steps",
         type=int,
-        default=1000,
+        default=500,
         help="Total number of training steps to perform.",
     )
     parser.add_argument(
@@ -106,16 +100,16 @@ def parse_args():
         help="Whether or not to use gradient checkpointing to save memory at the expense of slower backward pass.",
     )
     parser.add_argument(
-        "--emb_learning_rate",
-        type=float,
-        default=1e-3,
-        help="Learning rate for optimizing the embeddings.",
-    )
-    parser.add_argument(
         "--learning_rate",
         type=float,
-        default=1e-6,
+        default=8e-6,
         help="Learning rate for fine tuning the model.",
+    )
+    parser.add_argument(
+        "--l1_w",
+        type=float,
+        default=0.1,
+        help="L1 loss weight.",
     )
     parser.add_argument(
         "--scale_lr",
@@ -162,7 +156,7 @@ def parse_args():
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     parser.add_argument("--ddim_steps", type=int, default=50, help="DDIM steps")
-    parser.add_argument("--train_inference_steps", type=int, default=50, help="DDIM steps")
+    parser.add_argument("--train_inference_steps", type=int, default=6, help="DDIM steps")
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -249,8 +243,10 @@ def main():
     vae.eval()
     unet.train()
     text_encoder.eval()
+    clip.eval()
     freeze_params(vae.parameters())
     freeze_params(text_encoder.parameters())
+    freeze_params(clip.parameters())
 
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
@@ -403,6 +399,7 @@ def main():
                     decode_conditioned = decode_image(sample_conditioned.to(dtype=weight_dtype))
 
                     loss = clip_loss(list(origin_image), list(decode_conditioned))
+                    loss += args.l1_w * torch.nn.L1Loss()(origin_image, decode_conditioned)
 
                     accelerator.backward(loss)
                     # if accelerator.sync_gradients:     # results aren't good with it, may be will need more training with it.
