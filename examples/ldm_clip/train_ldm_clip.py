@@ -48,11 +48,11 @@ def parse_args():
         help="Train use target dataset name.",
     )
     parser.add_argument(
-        "--style_img_dir",
+        "--source_text",
         type=str,
         default=None,
         required=True,
-        help="Path to style images directory.",
+        help="The source text describing the original image.",
     )
     parser.add_argument(
         "--target_text",
@@ -254,6 +254,7 @@ def main():
 
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
+        vae.enable_gradient_checkpointing()
 
     if args.scale_lr:
         args.learning_rate = (
@@ -357,46 +358,23 @@ def main():
         loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(latents, decode_images), batch_size=args.train_batch_size, shuffle=True)
 
     # Encode the target text.
-    text_ids = tokenizer(
-        args.target_text,
-        padding="max_length",
-        truncation=True,
-        max_length=tokenizer.model_max_length,
-        return_tensors="pt",
-    ).input_ids
+    text_ids = torch.tensor([tokenizer.convert_tokens_to_ids(args.target_text)])
 
     text_ids = text_ids.to(device=accelerator.device)
     with torch.no_grad():
         target_embeddings = text_encoder(text_ids)[0]
 
     # Compute CLIP Loss
-    valid_exts = [".png", ".jpg", ".jpeg"]
-    file_list = [
-        os.path.join(args.style_img_dir, file_name)
-        for file_name in os.listdir(args.style_img_dir)
-        if os.path.splitext(file_name)[1].lower() in valid_exts
-    ]
     with torch.no_grad():
-        clip_loss.set_img2img_direction(list(decode_images), file_list)
-        [save_logs(im, logging_dir, i, 'origin') for i, im in enumerate(decode_images[:10])]
+        clip_loss.set_txt2txt_direction(args.source_text, args.target_text)
+
+    [save_logs(im, logging_dir, i, 'origin') for i, im in enumerate(decode_images[:10])]
 
     del text_encoder, dataset, decode_images, latents
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    optimized_embeddings = target_embeddings.clone().float()
-
-    # Optimize the text embeddings first.
-    optimized_embeddings.requires_grad_(True)
-    optimizer = optimizer_class(
-        [optimized_embeddings],  # only optimize embeddings
-        lr=args.emb_learning_rate,
-        betas=(args.adam_beta1, args.adam_beta2),
-        # weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon,
-    )
-
-    optimizer, clip_loss, loader, optimized_embeddings = accelerator.prepare(optimizer, clip_loss, loader, optimized_embeddings)
+    clip_loss, loader = accelerator.prepare(clip_loss, loader)
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
@@ -422,7 +400,7 @@ def main():
                     with torch.no_grad():
                         noisy_latents = noise_scheduler.add_noise(init_latents, noise, torch.tensor([noise_scheduler.timesteps[-timesteps]] * bsz, device=accelerator.device))
 
-                    sample_conditioned = denoise_one_step(noisy_latents, args.train_inference_steps - timesteps - 1, cond_embeddings=torch.cat([optimized_embeddings]*bsz))
+                    sample_conditioned = denoise(noisy_latents, -timesteps, cond_embeddings=torch.cat([target_embeddings]*bsz))
                     decode_conditioned = decode_image(sample_conditioned.to(dtype=weight_dtype))
 
                     loss = clip_loss(list(origin_image), list(decode_conditioned))
@@ -445,45 +423,33 @@ def main():
 
         accelerator.wait_for_everyone()
 
-    progress_bar = tqdm(range(args.emb_train_steps), disable=not accelerator.is_local_main_process)
-    progress_bar.set_description("Optimizing embedding")
+    # # Fine tune the diffusion model.
+    optimizer = optimizer_class(
+        unet.parameters(),
+        lr=args.learning_rate,
+        betas=(args.adam_beta1, args.adam_beta2),
+        # weight_decay=args.adam_weight_decay,
+        eps=args.adam_epsilon,
+    )
+    optimizer = accelerator.prepare(optimizer)
+
+    progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
+    progress_bar.set_description("Fine Tuning")
+    unet.train()
 
     train_loop(progress_bar, optimizer)
 
-    optimized_embeddings.requires_grad_(False)
+    Create the pipeline using using the trained modules and save it.
     if accelerator.is_main_process:
-        torch.save(target_embeddings.cpu(), os.path.join(args.output_dir, "target_embeddings.pt"))
-        torch.save(optimized_embeddings.cpu(), os.path.join(args.output_dir, "optimized_embeddings.pt"))
-        with open(os.path.join(args.output_dir, "target_text.txt"), "w") as f:
-            f.write(args.target_text)
+        pipeline = StableDiffusionPipeline.from_pretrained(
+            args.pretrained_model_name_or_path,
+            unet=accelerator.unwrap_model(unet),
+            use_auth_token=True
+        )
+        pipeline.save_pretrained(args.output_dir)
 
-    # # Fine tune the diffusion model.
-    # optimizer = optimizer_class(
-    #     accelerator.unwrap_model(unet).parameters(),
-    #     lr=args.learning_rate,
-    #     betas=(args.adam_beta1, args.adam_beta2),
-    #     # weight_decay=args.adam_weight_decay,
-    #     eps=args.adam_epsilon,
-    # )
-    # optimizer = accelerator.prepare(optimizer)
-
-    # progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
-    # progress_bar.set_description("Fine Tuning")
-    # unet.train()
-
-    # train_loop(progress_bar, optimizer, unet.parameters())
-
-    # Create the pipeline using using the trained modules and save it.
-    # if accelerator.is_main_process:
-    #     pipeline = StableDiffusionPipeline.from_pretrained(
-    #         args.pretrained_model_name_or_path,
-    #         unet=accelerator.unwrap_model(unet),
-    #         use_auth_token=True
-    #     )
-    #     pipeline.save_pretrained(args.output_dir)
-
-    #     if args.push_to_hub:
-    #         repo.push_to_hub(commit_message="End of training", blocking=False, auto_lfs_prune=True)
+        if args.push_to_hub:
+            repo.push_to_hub(commit_message="End of training", blocking=False, auto_lfs_prune=True)
 
     accelerator.end_training()
 

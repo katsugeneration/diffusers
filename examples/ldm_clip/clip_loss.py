@@ -41,6 +41,15 @@ class CLIPLoss(torch.nn.Module):
 
         self.direction = direction
 
+    def set_txt2txt_direction(self, source_class: str, target_class: str):
+        source_features = self.get_text_features(source_class)
+        target_features = self.get_text_features(target_class)
+
+        text_direction = (target_features - source_features).mean(axis=0, keepdim=True)
+        text_direction /= text_direction.norm(dim=-1, keepdim=True)
+
+        self.direction = text_direction
+
     def __call__(self, src_img: List[torch.Tensor], target_img: List[torch.Tensor]) -> torch.Tensor:
         transform = Compose(
             [
