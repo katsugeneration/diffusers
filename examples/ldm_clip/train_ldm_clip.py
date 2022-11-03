@@ -17,6 +17,7 @@ from PIL import Image
 import numpy as np
 from torchvision import transforms
 import datasets
+import fiftyone.zoo as foz
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer, CLIPModel, CLIPFeatureExtractor
 from clip_loss import CLIPLoss
@@ -238,6 +239,7 @@ def main():
     unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet", use_auth_token=True)
     clip = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
     feature_extractor = CLIPFeatureExtractor.from_pretrained("openai/clip-vit-large-patch14")
+    clip.text_model = text_encoder.text_model
     clip_loss = CLIPLoss(clip, feature_extractor, tokenizer)
 
     vae.eval()
@@ -290,7 +292,15 @@ def main():
 
     # Encode the input image.
     if args.target_dataset == "Imagenet":
-        dataset = datasets.load_dataset("mrm8488/ImageNet1K-val", split="train")
+        dataset = datasets.load_dataset("mrm8488/ImageNet1K-val", split="train")[:100]['image']
+    elif args.target_dataset == "OpenImages":
+        dataset = [Image.open(s.filepath).convert('RGB') for s in foz.load_zoo_dataset(
+            "open-images-v6",
+            split="validation",
+            max_samples=100,
+            seed=args.seed,
+            shuffle=True,
+        )]
 
     image_transforms = transforms.Compose(
         [
@@ -345,7 +355,7 @@ def main():
         img.save(imgpath)
 
     with torch.no_grad():
-        latents = torch.cat([encode_image(data) for data in dataset[:100]['image']]).to(dtype=weight_dtype)
+        latents = torch.cat([encode_image(data) for data in dataset]).to(dtype=weight_dtype)
         decode_images = torch.cat([decode_image(l[None]).cpu() for l in latents])
         loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(latents, decode_images), batch_size=args.train_batch_size, shuffle=True)
 
