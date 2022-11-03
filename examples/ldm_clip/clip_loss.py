@@ -89,8 +89,8 @@ class CLIPLoss(torch.nn.Module):
 
     def set_txt2txt_direction(self, source_class: str, target_class: str):
         with torch.no_grad():
-            source_features = self.get_text_features(source_class)
-            target_features = self.get_text_features(target_class)
+            source_features = self.get_text_features(source_class, templates=['{}'])
+            target_features = self.get_text_features(target_class, templates=['{}'])
 
             text_direction = (target_features - source_features).mean(axis=0, keepdim=True)
             text_direction /= text_direction.norm(dim=-1, keepdim=True)
