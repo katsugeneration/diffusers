@@ -113,6 +113,18 @@ def parse_args():
         help="L1 loss weight.",
     )
     parser.add_argument(
+        "--guidance_scale",
+        type=float,
+        default=7.5,
+        help="Target guidnace scale.",
+    )
+    parser.add_argument(
+        "--scheduler_offset",
+        type=int,
+        default=1,
+        help="An offset added to the inference steps.",
+    )
+    parser.add_argument(
         "--scale_lr",
         action="store_true",
         default=False,
@@ -272,7 +284,7 @@ def main():
         optimizer_class = torch.optim.Adam
 
     noise_scheduler = DDIMScheduler(
-        beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000
+        beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000, clip_sample=False, set_alpha_to_one=False, steps_offset=args.scheduler_offset
     )
     noise_scheduler.set_timesteps(args.ddim_steps)
 
@@ -301,6 +313,7 @@ def main():
             seed=args.seed,
             shuffle=True,
         )]
+    # TODO: Add FFHQ image load
 
     image_transforms = transforms.Compose(
         [
@@ -331,6 +344,12 @@ def main():
         for i, t in enumerate(timesteps):
             # predict the noise residual
             noise_pred = unet(latents, t, encoder_hidden_states=cond_embeddings).sample
+
+            # perform guidance
+            if do_classifier_free_guidance:
+                with torch.no_grad():
+                    noise_pred_uncond = unet(latents, t, encoder_hidden_states=uncond_embeddings).sample
+                noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred - noise_pred_uncond)
 
             # compute the previous noisy sample x_t -> x_t-1
             latents = noise_scheduler.step(noise_pred, t, latents).prev_sample
@@ -371,6 +390,28 @@ def main():
     with torch.no_grad():
         target_embeddings = text_encoder(text_ids)[0]
 
+    # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
+    # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
+    # corresponds to doing no classifier free guidance.
+    do_classifier_free_guidance = args.guidance_scale > 1.0
+    # get unconditional embeddings for classifier free guidance
+    if do_classifier_free_guidance:
+        uncond_tokens = [""]
+
+        max_length = target_embeddings.shape[-2]
+        with torch.no_grad():
+            uncond_input = tokenizer(
+                uncond_tokens,
+                padding="max_length",
+                max_length=max_length,
+                truncation=True,
+                return_tensors="pt",
+            )
+            uncond_embeddings = text_encoder(uncond_input.input_ids.to(target_embeddings.device))[0]
+
+            # duplicate unconditional embeddings for each generation per prompt
+            uncond_embeddings = uncond_embeddings.repeat_interleave(args.train_batch_size, dim=0)
+
     # Compute CLIP Loss
     with torch.no_grad():
         clip_loss.set_txt2txt_direction(args.source_text, args.target_text)
@@ -389,9 +430,12 @@ def main():
     def train_loop(pbar, optimizer):
         loss_avg = AverageMeter()
         for step in pbar:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             init_latents, origin_image = next(iter(loader))
             init_latents = init_latents.to(device=accelerator.device)
             origin_image = origin_image.to(device=accelerator.device)
+
             with accelerator.autocast():
                 with accelerator.accumulate(unet):
                     noise = torch.randn_like(init_latents)
@@ -403,7 +447,7 @@ def main():
                     # Add noise to the latents according to the noise magnitude at each timestep
                     # (this is the forward diffusion process)
                     with torch.no_grad():
-                        noisy_latents = noise_scheduler.add_noise(init_latents, noise, torch.tensor([noise_scheduler.timesteps[-timesteps]] * bsz, device=accelerator.device))
+                        noisy_latents = noise_scheduler.add_noise(init_latents, noise, torch.tensor([noise_scheduler.timesteps[-timesteps-args.scheduler_offset]] * bsz, device=accelerator.device))
 
                     sample_conditioned = denoise(noisy_latents, -timesteps, cond_embeddings=torch.cat([target_embeddings]*bsz))
                     decode_conditioned = decode_image(sample_conditioned.to(dtype=weight_dtype))
