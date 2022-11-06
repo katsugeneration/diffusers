@@ -11,7 +11,8 @@ import torch.utils.checkpoint
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
-from diffusers import AutoencoderKL, DDIMScheduler, StableDiffusionPipeline, UNet2DConditionModel
+from diffusers import DDIMScheduler, StableDiffusionPipeline, UNet2DConditionModel
+from vae import AutoencoderKL
 from huggingface_hub import HfFolder, Repository, whoami
 from PIL import Image
 import numpy as np
@@ -254,16 +255,17 @@ def main():
     clip.text_model = text_encoder.text_model
     clip_loss = CLIPLoss(clip, feature_extractor, tokenizer)
 
-    vae.eval()
+    vae.train()
     unet.train()
-    text_encoder.eval()
-    clip.eval()
+    text_encoder.train()
+    clip.train()
     freeze_params(vae.parameters())
     freeze_params(text_encoder.parameters())
     freeze_params(clip.parameters())
 
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
+        vae.enable_gradient_checkpointing()
 
     if args.scale_lr:
         args.learning_rate = (
@@ -297,9 +299,9 @@ def main():
     # Move text_encode and vae to gpu.
     # For mixed precision training we cast the text_encoder and vae weights to half-precision
     # as these models are only used for inference, keeping weights in full precision is not required.
-    text_encoder.to(accelerator.device, dtype=weight_dtype)
-    vae.to(accelerator.device, dtype=weight_dtype)
-    clip.to(accelerator.device, dtype=weight_dtype)
+    text_encoder.to(accelerator.device)
+    vae.to(accelerator.device)
+    clip.to(accelerator.device)
     unet.to(accelerator.device)
 
     # Encode the input image.
@@ -326,7 +328,7 @@ def main():
 
     def encode_image(image):
         image_tensor = image_transforms(image)
-        image_tensor = image_tensor[None].to(device=accelerator.device, dtype=weight_dtype)
+        image_tensor = image_tensor[None].to(device=accelerator.device)
         with torch.no_grad():
             image_latents = vae.encode(image_tensor).latent_dist.sample()
             image_latents = 0.18215 * image_latents
@@ -374,9 +376,9 @@ def main():
         img.save(imgpath)
 
     with torch.no_grad():
-        latents = torch.cat([encode_image(data) for data in dataset]).to(dtype=weight_dtype)
+        latents = torch.cat([encode_image(data) for data in dataset])
         decode_images = torch.cat([decode_image(l[None]).cpu() for l in latents])
-        loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(latents, decode_images), batch_size=args.train_batch_size, shuffle=True)
+        loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(latents.to(dtype=weight_dtype), decode_images), batch_size=args.train_batch_size, shuffle=True)
 
     # Encode the target text.
     text_ids = tokenizer(
@@ -450,7 +452,7 @@ def main():
                         noisy_latents = noise_scheduler.add_noise(init_latents, noise, torch.tensor([noise_scheduler.timesteps[-timesteps-args.scheduler_offset]] * bsz, device=accelerator.device))
 
                     sample_conditioned = denoise(noisy_latents, -timesteps, cond_embeddings=torch.cat([target_embeddings]*bsz))
-                    decode_conditioned = decode_image(sample_conditioned.to(dtype=weight_dtype))
+                    decode_conditioned = decode_image(sample_conditioned)
 
                     loss = clip_loss(list(origin_image), list(decode_conditioned))
                     loss += args.l1_w * torch.nn.L1Loss()(origin_image, decode_conditioned)
