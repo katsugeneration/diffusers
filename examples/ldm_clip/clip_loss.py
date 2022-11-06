@@ -117,5 +117,5 @@ class CLIPLoss(torch.nn.Module):
         )
 
         edit_direction = target_encoding - src_encoding
-        edit_direction /= edit_direction.norm(dim=-1, keepdim=True) + 1e-7
+        edit_direction /= edit_direction.clone().norm(dim=-1, keepdim=True) + 1e-7
         return (1 - torch.nn.CosineSimilarity()(edit_direction, self.direction)).mean()
