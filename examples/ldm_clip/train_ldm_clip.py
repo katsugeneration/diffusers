@@ -108,6 +108,18 @@ def parse_args():
         help="Learning rate for fine tuning the model.",
     )
     parser.add_argument(
+        "--lr_decay",
+        type=float,
+        default=0.999,
+        help="Learning rate decay gamma.",
+    )
+    parser.add_argument(
+        "--lr_decay_interval",
+        type=int,
+        default=10,
+        help="Learning rate decay every N steps.",
+    )
+    parser.add_argument(
         "--l1_w",
         type=float,
         default=0.1,
@@ -170,7 +182,7 @@ def parse_args():
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     parser.add_argument("--ddim_steps", type=int, default=50, help="DDIM steps")
-    parser.add_argument("--train_inference_steps", type=int, default=6, help="DDIM steps")
+    parser.add_argument("--train_inference_steps", type=int, default=6, help="training inference steps")
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -473,6 +485,9 @@ def main():
                         samples = torch.cat(list(samples), dim=-2)
                         save_logs(samples, logging_dir, step)
 
+                if not step % args.lr_decay_interval:
+                    lr_scheduler.step()
+
         accelerator.wait_for_everyone()
 
     # # Fine tune the diffusion model.
@@ -483,7 +498,12 @@ def main():
         # weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
-    unet, optimizer = accelerator.prepare(unet, optimizer)
+    lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(
+        optimizer,
+        gamma=args.lr_decay,
+        last_epoch=-1,
+    )
+    unet, optimizer, lr_scheduler = accelerator.prepare(unet, optimizer, lr_scheduler)
 
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Fine Tuning")
