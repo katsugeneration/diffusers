@@ -327,7 +327,16 @@ def main():
             seed=args.seed,
             shuffle=True,
         )]
-    # TODO: Add FFHQ image load
+    elif args.target_dataset == "Face":
+        dataset = [Image.open(s.filepath).convert('RGB') for s in foz.load_zoo_dataset(
+            "open-images-v6",
+            split="test",
+            max_samples=100,
+            label_types=['segmentations'],
+            classes =['Human mouth'],
+            seed=args.seed,
+            shuffle=True,
+        )]
 
     image_transforms = transforms.Compose(
         [
