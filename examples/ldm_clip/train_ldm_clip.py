@@ -20,7 +20,7 @@ from torchvision import transforms
 import datasets
 import fiftyone.zoo as foz
 from tqdm.auto import tqdm
-from transformers import CLIPTextModel, CLIPTokenizer, CLIPModel, CLIPFeatureExtractor
+from transformers import CLIPTextModel, CLIPTokenizer, CLIPModel
 from clip_loss import CLIPLoss
 
 
@@ -61,6 +61,17 @@ def parse_args():
         type=str,
         default=None,
         help="The target text describing the output image.",
+    )
+    parser.add_argument(
+        "--use_img2img_direction",
+        action="store_true",
+        help="Use img2img compute direction for CLIP Loss.",
+    )
+    parser.add_argument(
+        "--base_model_name_or_path",
+        type=str,
+        default="CompVis/stable-diffusion-v1-4",
+        help="Path to base model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
         "--output_dir",
@@ -259,18 +270,19 @@ def main():
         tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer", use_auth_token=True)
 
     # Load models and create wrapper for stable diffusion
-    text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder", use_auth_token=True)
-    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae", use_auth_token=True)
-    unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet", use_auth_token=True)
-    clip = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
-    feature_extractor = CLIPFeatureExtractor.from_pretrained("openai/clip-vit-large-patch14")
+    text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder", use_auth_token=True).to(accelerator.device)
+    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae", use_auth_token=True).to(accelerator.device)
+    unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet", use_auth_token=True).to(accelerator.device)
+    unet_base = UNet2DConditionModel.from_pretrained(args.base_model_name_or_path, subfolder="unet", use_auth_token=True).to(accelerator.device)
+    clip = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(accelerator.device)
     clip.text_model = text_encoder.text_model
-    clip_loss = CLIPLoss(clip, feature_extractor, tokenizer)
+    clip_loss = CLIPLoss(clip, tokenizer)
 
     vae.train()
     unet.train()
     text_encoder.train()
     clip.train()
+    unet_base.eval()
     freeze_params(vae.parameters())
     freeze_params(text_encoder.parameters())
     freeze_params(clip.parameters())
@@ -307,14 +319,6 @@ def main():
         weight_dtype = torch.float16
     elif args.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
-
-    # Move text_encode and vae to gpu.
-    # For mixed precision training we cast the text_encoder and vae weights to half-precision
-    # as these models are only used for inference, keeping weights in full precision is not required.
-    text_encoder.to(accelerator.device)
-    vae.to(accelerator.device)
-    clip.to(accelerator.device)
-    unet.to(accelerator.device)
 
     # Encode the input image.
     if args.target_dataset == "Imagenet":
@@ -361,7 +365,7 @@ def main():
         image = (image / 2 + 0.5).clamp(0, 1)
         return image
 
-    def denoise(latents, t_start, cond_embeddings=None):
+    def denoise(latents, t_start, cond_embeddings=None, unet=None):
         timesteps = noise_scheduler.timesteps[t_start:].to(accelerator.device)
 
         for i, t in enumerate(timesteps):
@@ -437,9 +441,44 @@ def main():
 
     # Compute CLIP Loss
     with torch.no_grad():
-        clip_loss.set_txt2txt_direction(args.source_text, args.target_text)
+        if args.use_img2img_direction:
+            text_ids = tokenizer(
+                args.source_text,
+                padding="max_length",
+                max_length=tokenizer.model_max_length,
+                return_tensors="pt",
+            ).input_ids
 
-    del text_encoder, dataset, decode_images, latents
+            text_ids = text_ids.to(device=accelerator.device)
+            source_embeddings = text_encoder(text_ids)[0]
+
+            noises = torch.randn((100, unet.in_channels, args.resolution // 8, args.resolution // 8), device=accelerator.device, dtype=weight_dtype)
+
+            clip_loss_logging_dir = os.path.join(logging_dir, "clip_loss")
+            os.makedirs(clip_loss_logging_dir, exist_ok=True)
+
+            def create_or_load_images(mode, embeddings, unet):
+                images = []
+                for p in Path(clip_loss_logging_dir).glob(f'{mode}*.png'):
+                    img = image_transforms(Image.open(p).convert('RGB')).cpu()
+                    images.append((img / 2 + 0.5).clamp(0, 1))
+                if len(images) != 100:
+                    for i, n in enumerate(noises):
+                        n = denoise(n.unsqueeze(0), 0, embeddings, unet)
+                        img = decode_image(n).cpu()[0]
+                        images.append(img)
+                        img = Image.fromarray((255 * img.permute(1, 2, 0).numpy()).astype(np.uint8))
+                        imgpath = os.path.join(clip_loss_logging_dir, f"{mode}_{i:06}.png")
+                        img.save(imgpath)
+                return images
+
+            source_images = create_or_load_images('source', source_embeddings, unet_base)
+            target_images = create_or_load_images('target', target_embeddings, unet)
+            clip_loss.set_img2img_direction(source_images, target_images)
+        else:
+            clip_loss.set_txt2txt_direction(args.source_text, args.target_text)
+
+    del text_encoder, unet_base, dataset, decode_images, latents
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -472,7 +511,7 @@ def main():
                     with torch.no_grad():
                         noisy_latents = noise_scheduler.add_noise(init_latents, noise, torch.tensor([noise_scheduler.timesteps[-timesteps-args.scheduler_offset]] * bsz, device=accelerator.device))
 
-                    sample_conditioned = denoise(noisy_latents, -timesteps, cond_embeddings=torch.cat([target_embeddings]*bsz))
+                    sample_conditioned = denoise(noisy_latents, -timesteps, cond_embeddings=torch.cat([target_embeddings]*bsz), unet=unet)
                     decode_conditioned = decode_image(sample_conditioned)
 
                     loss = clip_loss(list(origin_image), list(decode_conditioned))
