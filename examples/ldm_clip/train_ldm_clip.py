@@ -137,6 +137,12 @@ def parse_args():
         help="L1 loss weight.",
     )
     parser.add_argument(
+        "--noise_pred_loss_w",
+        type=float,
+        default=0.1,
+        help="noise prediction loss weight.",
+    )
+    parser.add_argument(
         "--guidance_scale",
         type=float,
         default=7.5,
@@ -367,10 +373,13 @@ def main():
 
     def denoise(latents, t_start, cond_embeddings=None, unet=None):
         timesteps = noise_scheduler.timesteps[t_start:].to(accelerator.device)
+        first_noise_pred = None
 
         for i, t in enumerate(timesteps):
             # predict the noise residual
             noise_pred = unet(latents, t, encoder_hidden_states=cond_embeddings).sample
+            if first_noise_pred is None:
+                first_noise_pred = noise_pred
 
             # perform guidance
             if do_classifier_free_guidance:
@@ -380,7 +389,7 @@ def main():
 
             # compute the previous noisy sample x_t -> x_t-1
             latents = noise_scheduler.step(noise_pred, t, latents).prev_sample
-        return latents
+        return latents, first_noise_pred
 
     def denoise_one_step(latents, t_start, cond_embeddings=None):
         t = noise_scheduler.timesteps[t_start].to(accelerator.device)
@@ -511,11 +520,12 @@ def main():
                     with torch.no_grad():
                         noisy_latents = noise_scheduler.add_noise(init_latents, noise, torch.tensor([noise_scheduler.timesteps[-timesteps-args.scheduler_offset]] * bsz, device=accelerator.device))
 
-                    sample_conditioned = denoise(noisy_latents, -timesteps, cond_embeddings=torch.cat([target_embeddings]*bsz), unet=unet)
+                    sample_conditioned, noise_pred = denoise(noisy_latents, -timesteps, cond_embeddings=torch.cat([target_embeddings]*bsz), unet=unet)
                     decode_conditioned = decode_image(sample_conditioned)
 
                     loss = clip_loss(list(origin_image), list(decode_conditioned))
                     loss += args.l1_w * torch.nn.L1Loss()(origin_image, decode_conditioned)
+                    loss += args.noise_pred_loss_w * torch.nn.MSELoss()(noise, noise_pred)
 
                     accelerator.backward(loss)
                     # if accelerator.sync_gradients:     # results aren't good with it, may be will need more training with it.
