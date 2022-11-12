@@ -67,6 +67,7 @@ def parse_args():
         action="store_true",
         help="Use img2img compute direction for CLIP Loss.",
     )
+    parser.add_argument("--clip_loss_ddim_steps", type=int, default=50, help="DDIM steps for clip loss compute image generator")
     parser.add_argument(
         "--base_model_name_or_path",
         type=str,
@@ -320,6 +321,11 @@ def main():
     )
     noise_scheduler.set_timesteps(args.ddim_steps)
 
+    clip_loss_noise_scheduler = DDIMScheduler(
+        beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000, clip_sample=False, set_alpha_to_one=False, steps_offset=args.scheduler_offset
+    )
+    clip_loss_noise_scheduler.set_timesteps(args.clip_loss_ddim_steps)
+
     weight_dtype = torch.float32
     if args.mixed_precision == "fp16":
         weight_dtype = torch.float16
@@ -371,7 +377,7 @@ def main():
         image = (image / 2 + 0.5).clamp(0, 1)
         return image
 
-    def denoise(latents, t_start, cond_embeddings=None, unet=None):
+    def denoise(latents, t_start, cond_embeddings=None, unet=None, noise_scheduler=None):
         timesteps = noise_scheduler.timesteps[t_start:].to(accelerator.device)
         first_noise_pred = None
 
@@ -473,7 +479,7 @@ def main():
                     images.append((img / 2 + 0.5).clamp(0, 1))
                 if len(images) != 100:
                     for i, n in enumerate(noises):
-                        n = denoise(n.unsqueeze(0), 0, embeddings, unet)
+                        n, _ = denoise(n.unsqueeze(0), 0, embeddings, unet, clip_loss_noise_scheduler)
                         img = decode_image(n).cpu()[0]
                         images.append(img)
                         img = Image.fromarray((255 * img.permute(1, 2, 0).numpy()).astype(np.uint8))
@@ -520,7 +526,7 @@ def main():
                     with torch.no_grad():
                         noisy_latents = noise_scheduler.add_noise(init_latents, noise, torch.tensor([noise_scheduler.timesteps[-timesteps-args.scheduler_offset]] * bsz, device=accelerator.device))
 
-                    sample_conditioned, noise_pred = denoise(noisy_latents, -timesteps, cond_embeddings=torch.cat([target_embeddings]*bsz), unet=unet)
+                    sample_conditioned, noise_pred = denoise(noisy_latents, -timesteps, cond_embeddings=torch.cat([target_embeddings]*bsz), unet=unet, noise_scheduler=noise_scheduler)
                     decode_conditioned = decode_image(sample_conditioned)
 
                     loss = clip_loss(list(origin_image), list(decode_conditioned))
