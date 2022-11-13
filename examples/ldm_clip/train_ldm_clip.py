@@ -1,5 +1,5 @@
 import argparse
-import math
+import json
 import os
 from pathlib import Path
 from typing import Optional
@@ -242,6 +242,9 @@ def freeze_params(params):
 def main():
     args = parse_args()
     logging_dir = Path(args.output_dir, args.logging_dir)
+    logging_dir.mkdir(exist_ok=True, parents=True)
+    with logging_dir.joinpath('options.json').open('w') as f:
+        json.dump(args.__dict__, f)
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
